@@ -18,7 +18,7 @@ jobs:
         run: |
           # 设置 runner 用户的强密码（默认账号为 runner）
           RUNNER_PASS="Password1234@"
-          sudo dscl . -passwd /Users/runner "$RUNNER_PASS"
+          sudo sysadminctl -resetPasswordFor runner -newPassword "$RUNNER_PASS"
           
           # 启动 macOS 远程登录 (SSHD)
           sudo systemsetup -setremotelogin on
