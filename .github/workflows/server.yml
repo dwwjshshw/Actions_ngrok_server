@@ -1,107 +1,163 @@
-name: macOS
+name: Multi-Platform Build & Remote Debug Pipeline
 
 on:
-  workflow_dispatch: # 支持在 GitHub Actions 页面手动点击运行
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: # 支持手动触发
 
 jobs:
-  ssh-session:
-    name: macOS SSH runnner
-    runs-on: macos-latest
+  # =========================================================
+  # Job 1: 跨平台自动化编译矩阵 (macOS, Windows, Linux)
+  # =========================================================
+  build-matrix:
+    name: Build (${{ matrix.target-platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # 单个平台失败不影响其他平台打包
+      matrix:
+        include:
+          - os: macos-latest
+            target-platform: macos-ios-android
+          - os: windows-latest
+            target-platform: windows
+          - os: ubuntu-latest
+            target-platform: linux
 
     steps:
-      # 1. 检出代码
+      - name: Checkout Facetory
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          submodules: recursive
+
+      - name: Checkout ClaralightDesign-Flutter
+        uses: actions/checkout@v4
+        with:
+          repository: AstralSightStudios/ClaralightDesign-Flutter
+          token: ${{ secrets.GH_PAT }}
+          path: ClaralightDesign-Flutter
+
+      # ---------------- Setup Tools ----------------
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,aarch64-apple-ios' || '' }}
+
+      # Linux 系统依赖补全
+      - name: Install Linux Build Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+
+      # ---------------- Fix Apple AppIcon ----------------
+      - name: Fix AppIcon Directory Conflict (macOS Only)
+        if: runner.os == 'macOS'
+        run: |
+          if [ -d "ios/AppIcon.icon" ]; then
+            mkdir -p ios/Runner/Assets.xcassets/AppIcon.appiconset
+            cp -Rf ios/AppIcon.icon/* ios/Runner/Assets.xcassets/AppIcon.appiconset/
+            rm -rf ios/AppIcon.icon
+          fi
+          if [ -d "macos/AppIcon.icon" ]; then
+            mkdir -p macos/Runner/Assets.xcassets/AppIcon.appiconset
+            cp -Rf macos/AppIcon.icon/* macos/Runner/Assets.xcassets/AppIcon.appiconset/
+            rm -rf macos/AppIcon.icon
+          fi
+
+      # ---------------- Install Dependencies ----------------
+      - name: Install Flutter Dependencies
+        run: flutter pub get
+
+      - name: Install CocoaPods (macOS Only)
+        if: runner.os == 'macOS'
+        run: |
+          cd macos && pod install --no-repo-update && cd ..
+          cd ios && pod install --no-repo-update && cd ..
+
+      # ---------------- Build Artifacts ----------------
+      # 1. macOS 节点：构建 macOS, iOS, Android
+      - name: Build macOS / iOS / Android
+        if: runner.os == 'macOS'
+        run: |
+          flutter build apk --debug
+          flutter build macos --release
+          flutter build ios --release --no-codesign
+
+      # 2. Windows 节点：构建 Windows EXE
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        run: |
+          flutter build windows --release
+
+      # 3. Linux 节点：构建 Linux Bundle
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: |
+          flutter build linux --release
+
+      # ---------------- Upload Artifacts ----------------
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Facetory-Build-${{ matrix.target-platform }}
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            build/macos/Build/Products/Release/*.app
+            build/ios/iphoneos/*.app
+            build/windows/runner/Release/*
+            build/linux/x64/release/bundle/*
+
+  # =========================================================
+  # Job 2: 保持 macOS 远程 SSH 调试通道 (针对 macOS 节点)
+  # =========================================================
+  remote-ssh-debug:
+    name: macOS Remote SSH Tunnel (ngrok)
+    runs-on: macos-latest
+    # 允许与编译任务并行运行，或仅在需要远程调试时开启
+    steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. 配置 macOS 本地 SSH 服务与密码
-      - name: Configure macOS SSH Service
+      - name: Configure macOS SSH & Set Password
         run: |
-          # 设置 runner 用户的强密码（默认账号为 runner）
           RUNNER_PASS="Password1234@"
-          sudo sysadminctl -resetPasswordFor runner -newPassword "$RUNNER_PASS"
+          sudo dscl . -passwd /Users/runner "$RUNNER_PASS" "$RUNNER_PASS" 2>/dev/null || \
+          sudo dscl . -create /Users/runner passwd "$RUNNER_PASS"
           
-          # 启动 macOS 远程登录 (SSHD)
           sudo systemsetup -setremotelogin on
-          
-          # 确保 sshd 配置允许密码及公钥登录
           sudo sed -i '' 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i '' 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
 
-          # 如果配置了公钥，写入 authorized_keys
-          if [ -n "${{ secrets.SSH_PUB_KEY }}" ]; then
-            mkdir -p ~/.ssh
-            echo "${{ secrets.SSH_PUB_KEY }}" >> ~/.ssh/authorized_keys
-            chmod 600 ~/.ssh/authorized_keys
-            chmod 700 ~/.ssh
-          fi
-
-      # 3. 安装并配置 ngrok TCP 穿透
-      - name: Setup & Launch ngrok TCP Tunnel
+      - name: Setup ngrok Tunnel
         env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          NGROK_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          if [ -z "$NGROK_AUTHTOKEN" ]; then
-            echo "::error::未配置 NGROK_AUTHTOKEN Secret，请先在仓库 Settings -> Secrets 中添加！"
-            exit 1
-          fi
-
-          # 安装 ngrok
           brew install ngrok/ngrok/ngrok
-
-          # 配置 Authtoken
-          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-
-          # 在后台启动 ngrok 转发本地 SSH 22 端口
-          ngrok tcp 22 --log=stdout > ngrok.log 2>&1 &
-          
-          # 等待 Tunnel 建立并提取公网连接信息
-          echo "等待 ngrok 建立隧道..."
+          ngrok config add-authtoken $NGROK_TOKEN
+          ngrok tcp 22 --log=stdout > ngrok.log &
           sleep 5
-          
-          # 解析 ngrok API 获取公网 IP 和端口
-          TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n 1)
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "::error::ngrok 启动失败，日志如下："
-            cat ngrok.log
-            exit 1
-          fi
-
-          # 格式化提取 Host 和 Port
-          CLEAN_URL=${TUNNEL_URL#tcp://}
-          HOST=$(echo $CLEAN_URL | cut -d: -f1)
-          PORT=$(echo $CLEAN_URL | cut -d: -f2)
-
           echo "======================================================="
-          echo "                    SSH 远程连接已就绪！                  "
-          echo "-------------------------------------------------------"
-          echo "📌 SSH 命令："
-          echo "   ssh runner@${HOST} -p ${PORT}"
-          echo ""
-          echo "🔑 默认密码："
-          echo "   Password1234@"
+          echo "🌐 SSH 连接地址如下："
+          curl -s http://localhost:4040/api/tunnels | grep -o '"public_url":"tcp://[^"]*' | sed 's/"public_url":"tcp:\/\///'
+          echo "🔑 Password: Password1234@"
           echo "======================================================="
 
-      # 4. 自动保活心跳机制 (Keep-Alive)
-      - name: Keep Alive & Heartbeat Loop
+      - name: Keep Tunnel Alive
         run: |
-          echo "开始心跳保活程序，任务将维持运行，直到达到 GitHub Actions 单次最长上限 (6小时) 或手动 Cancel..."
-          
-          COUNTER=0
-          while true; do
-            COUNTER=$((COUNTER + 1))
-            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-            
-            # 每 30 秒打印一次心跳输出，防止 Actions 触发 10 分钟无输出强制超时断开
-            echo "[$TIMESTAMP] [Keep-Alive] macOS SSH Session Alive... (Heartbeat #${COUNTER})"
-            
-            # 检查 ngrok 进程是否还在运行，若挂掉则尝试拉起
-            if ! pgrep -x "ngrok" > /dev/null; then
-              echo "[$TIMESTAMP] 警告: ngrok 掉线，正在尝试重新拉起..."
-              ngrok tcp 22 --log=stdout > ngrok.log 2>&1 &
-            fi
-            
-            sleep 30
-          done
+          echo "🚀 隧道已建立，开始保活..."
+          while true; do sleep 30; done
