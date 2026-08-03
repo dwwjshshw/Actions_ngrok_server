@@ -1,2 +1,107 @@
- env:
-   
+name: macOS
+
+on:
+  workflow_dispatch: # 支持在 GitHub Actions 页面手动点击运行
+
+jobs:
+  ssh-session:
+    name: macOS SSH runnner
+    runs-on: macos-latest
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 1. 配置 macOS 本地 SSH 服务与密码
+      - name: Configure macOS SSH Service
+        run: |
+          # 设置 runner 用户的强密码（默认账号为 runner）
+          RUNNER_PASS="Password1234@"
+          echo "runner:${RUNNER_PASS}" | sudo chpasswd
+          
+          # 启动 macOS 远程登录 (SSHD)
+          sudo systemsetup -setremotelogin on
+          
+          # 确保 sshd 配置允许密码及公钥登录
+          sudo sed -i '' 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i '' 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
+
+          # 如果配置了公钥，写入 authorized_keys
+          if [ -n "${{ secrets.SSH_PUB_KEY }}" ]; then
+            mkdir -p ~/.ssh
+            echo "${{ secrets.SSH_PUB_KEY }}" >> ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+            chmod 700 ~/.ssh
+          fi
+
+      # 3. 安装并配置 ngrok TCP 穿透
+      - name: Setup & Launch ngrok TCP Tunnel
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          if [ -z "$NGROK_AUTHTOKEN" ]; then
+            echo "::error::未配置 NGROK_AUTHTOKEN Secret，请先在仓库 Settings -> Secrets 中添加！"
+            exit 1
+          fi
+
+          # 安装 ngrok
+          brew install ngrok/ngrok/ngrok
+
+          # 配置 Authtoken
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+
+          # 在后台启动 ngrok 转发本地 SSH 22 端口
+          ngrok tcp 22 --log=stdout > ngrok.log 2>&1 &
+          
+          # 等待 Tunnel 建立并提取公网连接信息
+          echo "等待 ngrok 建立隧道..."
+          sleep 5
+          
+          # 解析 ngrok API 获取公网 IP 和端口
+          TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n 1)
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "::error::ngrok 启动失败，日志如下："
+            cat ngrok.log
+            exit 1
+          fi
+
+          # 格式化提取 Host 和 Port
+          CLEAN_URL=${TUNNEL_URL#tcp://}
+          HOST=$(echo $CLEAN_URL | cut -d: -f1)
+          PORT=$(echo $CLEAN_URL | cut -d: -f2)
+
+          echo "======================================================="
+          echo "                    SSH 远程连接已就绪！                  "
+          echo "-------------------------------------------------------"
+          echo "📌 SSH 命令："
+          echo "   ssh runner@${HOST} -p ${PORT}"
+          echo ""
+          echo "🔑 默认密码："
+          echo "   Password1234@"
+          echo "======================================================="
+
+      # 4. 自动保活心跳机制 (Keep-Alive)
+      - name: Keep Alive & Heartbeat Loop
+        run: |
+          echo "开始心跳保活程序，任务将维持运行，直到达到 GitHub Actions 单次最长上限 (6小时) 或手动 Cancel..."
+          
+          COUNTER=0
+          while true; do
+            COUNTER=$((COUNTER + 1))
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            
+            # 每 30 秒打印一次心跳输出，防止 Actions 触发 10 分钟无输出强制超时断开
+            echo "[$TIMESTAMP] [Keep-Alive] macOS SSH Session Alive... (Heartbeat #${COUNTER})"
+            
+            # 检查 ngrok 进程是否还在运行，若挂掉则尝试拉起
+            if ! pgrep -x "ngrok" > /dev/null; then
+              echo "[$TIMESTAMP] 警告: ngrok 掉线，正在尝试重新拉起..."
+              ngrok tcp 22 --log=stdout > ngrok.log 2>&1 &
+            fi
+            
+            sleep 30
+          done
