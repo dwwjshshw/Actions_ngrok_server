@@ -25,7 +25,7 @@ jobs:
     if: inputs.enable_macos
     runs-on: macos-latest
     steps:
-      - name: Configure SSH Key
+      - name: Configure SSH Key & Start SSHD
         env:
           SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
@@ -33,13 +33,26 @@ jobs:
             echo "❌ 错误：未配置 SSH_PUBLIC_KEY！"
             exit 1
           fi
+
+          # 1. 配置公钥与权限
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
           chmod 600 ~/.ssh/authorized_keys
-          
-          # 启动 SSH 服务
-          sudo systemsetup -setremotelogin on || true
+
+          # 2. 强行修改 sshd_config 开启公钥登录并关闭 StrictModes
+          sudo sed -i '' 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i '' 's/#StrictModes yes/StrictModes no/' /etc/ssh/sshd_config
+          echo "PubkeyAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
+          echo "AuthorizedKeysFile .ssh/authorized_keys" | sudo tee -a /etc/ssh/sshd_config
+
+          # 3. 强制启动 SSHD 进程
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          sudo systemsetup -setremotelogin on 2>/dev/null || true
+
+          # 4. 检查 22 端口是否成功开启
+          sleep 2
+          netstat -an | grep '\.22 ' || echo "⚠️ 警告: 22 端口可能尚未监听！"
 
       - name: Start ngrok
         env:
@@ -69,7 +82,7 @@ jobs:
     if: inputs.enable_linux
     runs-on: ubuntu-latest
     steps:
-      - name: Configure SSH Key
+      - name: Configure SSH Key & Start SSHD
         env:
           SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
@@ -77,11 +90,22 @@ jobs:
             echo "❌ 错误：未配置 SSH_PUBLIC_KEY！"
             exit 1
           fi
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          sudo systemctl start ssh
+
+          # 1. 写入公钥并修正权限
+          mkdir -p /home/runner/.ssh
+          echo "$SSH_KEY" > /home/runner/.ssh/authorized_keys
+          chmod 700 /home/runner/.ssh
+          chmod 600 /home/runner/.ssh/authorized_keys
+          chown -R runner:runner /home/runner/.ssh
+
+          # 2. 修正 sshd 配置
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#StrictModes yes/StrictModes no/' /etc/ssh/sshd_config
+          echo "PubkeyAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
+          echo "AuthorizedKeysFile .ssh/authorized_keys" | sudo tee -a /etc/ssh/sshd_config
+
+          # 3. 重启 SSH 服务
+          sudo systemctl restart ssh
 
       - name: Start ngrok
         env:
@@ -113,7 +137,7 @@ jobs:
     if: inputs.enable_windows
     runs-on: windows-latest
     steps:
-      - name: Configure SSH Key
+      - name: Configure SSH Key & Start SSHD
         shell: powershell
         env:
           SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
@@ -122,16 +146,18 @@ jobs:
             Write-Error "ERROR: SSH_PUBLIC_KEY is missing"
             exit 1
           }
-          # Windows OpenSSH 管理员用户的 authorized_keys 默认存储路径
+          # Windows OpenSSH 管理员 authorized_keys 存储路径
           $Path = "C:\ProgramData\ssh\administrators_authorized_keys"
           New-Item -ItemType File -Path $Path -Force
           Add-Content -Path $Path -Value $env:SSH_KEY
-          
-          # 修复 Windows administrators_authorized_keys 文件 ACL 权限
+
+          # 修复文件 ACL 权限
           icacls.exe $Path /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
-          
+
+          # 启动 sshd 服务并开启防火墙
           Set-Service -Name sshd -StartupType 'Automatic'
           Start-Service sshd
+          New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue
 
       - name: Start ngrok
         shell: powershell
@@ -148,7 +174,7 @@ jobs:
           Start-Sleep -Seconds 5
           $Response = Invoke-RestMethod -Uri 'http://localhost:4040/api/tunnels'
           $Url = $Response.tunnels[0].public_url -replace 'tcp://', ''
-          
+
           Write-Output "=== Windows SSH ADDRESS ==="
           Write-Output "SSH URL: $Url"
           Write-Output "User: runneradmin | Auth: SSH Private Key"
