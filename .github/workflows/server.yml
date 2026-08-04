@@ -10,11 +10,11 @@ on:
       enable_windows:
         description: '开启 Windows 节点'
         type: boolean
-        default: false
+        default: true
       enable_linux:
         description: '开启 Linux 节点'
         type: boolean
-        default: false
+        default: true
 
 jobs:
   # ==========================================
@@ -23,7 +23,7 @@ jobs:
   ssh-macos:
     name: SSH (macOS)
     if: inputs.enable_macos
-    runs-on: macos-latest-xlarge
+    runs-on: macos-latest
     steps:
       - name: Configure SSH Key & Start Userspace SSHD
         env:
